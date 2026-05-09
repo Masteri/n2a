@@ -1,0 +1,35 @@
+# Never commit these
+**/.env
+**/.env.bak.*
+**/.env.example   # contains a lot of placeholder noise; opt in if you want
+*.bak.*
+*.password.txt
+*.htpasswd
+.htpasswd
+
+# Live secret files
+KEYS.txt
+private_key.txt
+mysql_root_password.txt
+freepbxuser_password.txt
+sasl_passwd.txt
+.credentials.txt
+.ari-credentials.txt
+
+# Recordings (audio data; can be large + privacy-sensitive)
+**/monitor/*.wav
+**/test-speech*.wav
+**/silence*.wav
+*.wav
+
+# Conversation transcript (contains tool-output secrets — NEVER push)
+n8n-freepbx-conversation.md
+*conversation*.md
+
+# Local-only state
+.DS_Store
+*.pyc
+__pycache__/
+
+# baresip / asterisk runtime state we accidentally copy
+*.log

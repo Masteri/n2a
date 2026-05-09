@@ -1,0 +1,1073 @@
+{
+  "id": "freepbx-hubspot-logger",
+  "name": "FreePBX → HubSpot Call Logger v3",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "freepbx-call-end",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh-1",
+      "name": "Webhook (FreePBX)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        320
+      ],
+      "webhookId": "freepbx-call-end"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Normalize the FreePBX (or any PBX) call-end webhook payload.\nconst raw = $input.first().json;\nlet body = raw.body || raw;\n\n// Recover from broken senders that produce { \"<one-big-string>\": \"\" } shape:\n//   - clients that URL-encode JSON but advertise Content-Type: application/json\n//   - clients that replace ASCII spaces with literal underscores\n//   - any other mangling that prevents express.json from parsing\n// Try a series of recovery strategies; first one that yields valid JSON wins.\nif (body && typeof body === 'object' && !Array.isArray(body)) {\n  const keys = Object.keys(body);\n  if (keys.length === 1 && body[keys[0]] === '' && /^\\s*\\{[\\s\\S]*\\}\\s*$/.test(keys[0])) {\n    const raw = keys[0];\n    // Strategy 1: parse as-is\n    let recovered = null;\n    try { recovered = JSON.parse(raw); } catch (_e) {}\n    // Strategy 2: replace structural underscores with spaces (outside strings).\n    if (!recovered) {\n      let out = '';\n      let inString = false;\n      let escaped = false;\n      for (let i = 0; i < raw.length; i++) {\n        const c = raw[i];\n        if (escaped) { out += c; escaped = false; continue; }\n        if (c === '\\\\') { out += c; escaped = true; continue; }\n        if (c === '\"') { inString = !inString; out += c; continue; }\n        if (!inString && c === '_') { out += ' '; continue; }\n        out += c;\n      }\n      try { recovered = JSON.parse(out); } catch (_e) {}\n    }\n    if (recovered && typeof recovered === 'object') body = recovered;\n  }\n}\n\n// --- direction --- (inbound / outbound; anything else -> inbound)\nconst directionRaw = (body.direction || 'inbound').toString().toLowerCase().trim();\nconst hsDirection = directionRaw === 'outbound' ? 'OUTBOUND' : 'INBOUND';\n\n// --- src / dst / external party phone ---\nconst src = (body.src || body.from || body.caller || '').toString().trim();\nconst dst = (body.dst || body.to || body.callee || '').toString().trim();\nconst phoneOverride = (body.phone || '').toString().trim();\nconst externalRaw = phoneOverride || (hsDirection === 'OUTBOUND' ? dst : src) || src || dst || '';\n\nconst digits = externalRaw.replace(/\\D/g, '');\nconst last10 = digits.slice(-10);\nconst e164 = digits ? '+' + digits : '';\n\n// --- duration ---\nconst durationSec = Math.max(0, parseInt(body.duration || body.billsec || 0, 10) || 0);\nconst durationMs = durationSec * 1000;\n\n// --- disposition -> hs_call_status ---\nconst disposition = (body.disposition || 'UNKNOWN').toString().toUpperCase().trim();\nconst statusMap = {\n  'ANSWERED': 'COMPLETED',\n  'COMPLETED': 'COMPLETED',\n  'NO ANSWER': 'NO_ANSWER',\n  'NOANSWER': 'NO_ANSWER',\n  'NO_ANSWER': 'NO_ANSWER',\n  'BUSY': 'BUSY',\n  'FAILED': 'FAILED',\n  'CONGESTION': 'FAILED',\n  'CHANUNAVAIL': 'FAILED',\n  'CANCEL': 'CANCELED',\n  'CANCELED': 'CANCELED',\n  'CANCELLED': 'CANCELED',\n  'VOICEMAIL': 'COMPLETED',\n  'UNKNOWN': 'COMPLETED'\n};\nconst hsStatus = statusMap[disposition] || 'COMPLETED';\n\n// --- timestamp -> epoch ms (HubSpot accepts ms or ISO) ---\nfunction toMs(v) {\n  if (v === undefined || v === null || v === '') return Date.now();\n  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;\n  const s = v.toString().trim();\n  if (/^\\d+$/.test(s)) {\n    const n = parseInt(s, 10);\n    return n < 1e12 ? n * 1000 : n;\n  }\n  // ISO or naive 'YYYY-MM-DD HH:MM:SS' (assume UTC)\n  const cleaned = s.replace(' ', 'T');\n  const withZ = /[Zz]|[+\\-]\\d{2}:?\\d{2}$/.test(cleaned) ? cleaned : cleaned + 'Z';\n  const d = new Date(withZ);\n  return isNaN(d.getTime()) ? Date.now() : d.getTime();\n}\nconst startMs = toMs(body.start_time || body.timestamp || body.start);\nconst startISO = new Date(startMs).toISOString();\n\n// --- uniqueid (fallback if PBX did not send one) ---\nconst uniqueid = (body.uniqueid || body.call_id || body.callid || `${startMs}-${digits || 'na'}`).toString();\n\n// --- caller name / contact attributes (for auto-create) ---\nconst callerName = (body.caller_name || body.callerid_name || body.cnam || '').toString().trim();\nconst firstName = (body.firstname || (callerName.split(' ')[0] || 'Unknown')).toString().slice(0, 60);\nconst lastNameDefault = `Caller-${last10.slice(-4) || (digits.slice(-4) || 'NA')}`;\nconst lastName = (body.lastname || (callerName.split(' ').slice(1).join(' ') || lastNameDefault)).toString().slice(0, 60);\nconst email = (body.email || '').toString().trim();\n\n// --- presentational ---\nconst title = `${hsDirection === 'INBOUND' ? 'Inbound' : 'Outbound'} call ${hsDirection === 'INBOUND' ? 'from' : 'to'} ${e164 || externalRaw || 'unknown'}`;\nconst callBodyLines = [\n  `Disposition: ${disposition} (${hsStatus})`,\n  `Duration: ${durationSec}s`,\n  `From: ${src || 'unknown'}`,\n  `To: ${dst || 'unknown'}`,\n  `Direction: ${hsDirection}`,\n  `External ID: ${uniqueid}`,\n  '',\n  '(transcript pending)'\n];\nconst callBody = callBodyLines.join('\\n');\n\nreturn [{\n  json: {\n    uniqueid,\n    src,\n    dst,\n    externalRaw,\n    digits,\n    last10,\n    e164,\n    direction: directionRaw,\n    hsDirection,\n    durationSec,\n    durationMs,\n    disposition,\n    hsStatus,\n    startMs,\n    startISO,\n    firstName,\n    lastName,\n    email,\n    title,\n    callBody,\n    original: body\n  }\n}];"
+      },
+      "id": "norm-1",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/calls/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"filterGroups\": [\n    { \"filters\": [\n      { \"propertyName\": \"hs_call_external_id\", \"operator\": \"EQ\", \"value\": \"{{ $json.uniqueid }}\" }\n    ]}\n  ],\n  \"properties\": [\"hs_call_body\", \"hs_call_status\", \"hs_call_duration\"],\n  \"limit\": 1\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "search-call-1",
+      "name": "Search Call by external_id",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"filterGroups\": [\n    { \"filters\": [ { \"propertyName\": \"phone\", \"operator\": \"CONTAINS_TOKEN\", \"value\": \"{{ $('Normalize').item.json.last10 || '__no_phone_token__' }}\" } ] },\n    { \"filters\": [ { \"propertyName\": \"mobilephone\", \"operator\": \"CONTAINS_TOKEN\", \"value\": \"{{ $('Normalize').item.json.last10 || '__no_phone_token__' }}\" } ] },\n    { \"filters\": [ { \"propertyName\": \"phone\", \"operator\": \"CONTAINS_TOKEN\", \"value\": \"{{ $('Normalize').item.json.digits || '__no_phone_token__' }}\" } ] },\n    { \"filters\": [ { \"propertyName\": \"mobilephone\", \"operator\": \"CONTAINS_TOKEN\", \"value\": \"{{ $('Normalize').item.json.digits || '__no_phone_token__' }}\" } ] },\n    { \"filters\": [ { \"propertyName\": \"hs_searchable_calculated_phone_number\", \"operator\": \"CONTAINS_TOKEN\", \"value\": \"{{ $('Normalize').item.json.last10 || '__no_phone_token__' }}\" } ] }\n  ],\n  \"properties\": [\"phone\", \"mobilephone\", \"firstname\", \"lastname\", \"email\"],\n  \"limit\": 1\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "search-contact-1",
+      "name": "Search Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Plan node: aggregates results from upstream lookups and decides actions.\nconst contactSearch = $input.first().json;\nconst callSearch = $('Search Call by external_id').item.json;\nconst norm = $('Normalize').item.json;\n\nconst contactId = (contactSearch && contactSearch.results && contactSearch.results[0] && contactSearch.results[0].id) || '';\nconst existingCallId = (callSearch && callSearch.results && callSearch.results[0] && callSearch.results[0].id) || '';\n\nconst needCreateContact = !contactId && !!norm.digits;  // only create if we actually have a phone\n\nreturn [{\n  json: {\n    ...norm,\n    contact_id: contactId,\n    existing_call_id: existingCallId,\n    need_create_contact: needCreateContact\n  }\n}];"
+      },
+      "id": "plan-1",
+      "name": "Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-cc",
+              "leftValue": "={{ $json.need_create_contact }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-cc",
+      "name": "Need create contact?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.1,
+      "position": [
+        1320,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"phone\": \"{{ $json.e164 }}\",\n    \"firstname\": \"{{ $json.firstName }}\",\n    \"lastname\": \"{{ $json.lastName }}\"{{ $json.email ? `,\\n    \"email\": \"${$json.email}\"` : '' }},\n    \"lifecyclestage\": \"lead\",\n    \"hs_lead_status\": \"NEW\"\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "create-contact-1",
+      "name": "Create Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        220
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Resolved-after-create: take new contact id from HubSpot response, carry forward Plan fields.\nconst created = $input.first().json;\nconst plan = $('Plan').item.json;\nreturn [{\n  json: {\n    ...plan,\n    contact_id: created.id || plan.contact_id,\n    contact_was_created: true\n  }\n}];"
+      },
+      "id": "resolved-after-create",
+      "name": "Resolved (created)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Resolved-existing: pass through Plan fields (contact already existed).\nconst plan = $input.first().json;\nreturn [{\n  json: {\n    ...plan,\n    contact_was_created: false\n  }\n}];"
+      },
+      "id": "resolved-existing",
+      "name": "Resolved (existing)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-call",
+              "leftValue": "={{ $json.existing_call_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-call",
+      "name": "Call exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.1,
+      "position": [
+        1980,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/calls/{{ $json.existing_call_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_call_title\": {{ JSON.stringify($json.title) }},\n    \"hs_call_body\": {{ JSON.stringify($json.callBody) }},\n    \"hs_call_status\": \"{{ $json.hsStatus }}\",\n    \"hs_call_duration\": {{ $json.durationMs }},\n    \"hs_call_direction\": \"{{ $json.hsDirection }}\",\n    \"hs_call_from_number\": \"{{ $json.src || $json.externalRaw }}\",\n    \"hs_call_to_number\": \"{{ $json.dst || $json.externalRaw }}\"\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "patch-call",
+      "name": "PATCH Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        220
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/calls",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_call_title\": {{ JSON.stringify($json.title) }},\n    \"hs_call_body\": {{ JSON.stringify($json.callBody) }},\n    \"hs_call_direction\": \"{{ $json.hsDirection }}\",\n    \"hs_call_status\": \"{{ $json.hsStatus }}\",\n    \"hs_call_duration\": {{ $json.durationMs }},\n    \"hs_call_from_number\": \"{{ $json.src || $json.externalRaw }}\",\n    \"hs_call_to_number\": \"{{ $json.dst || $json.externalRaw }}\",\n    \"hs_timestamp\": \"{{ $json.startISO }}\",\n    \"hs_call_external_id\": \"{{ $json.uniqueid }}\"\n  }{{ $json.contact_id ? `,\n  \"associations\": [\n    {\n      \"to\": { \"id\": \"${$json.contact_id}\" },\n      \"types\": [ { \"associationCategory\": \"HUBSPOT_DEFINED\", \"associationTypeId\": 194 } ]\n    }\n  ]` : '' }}\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "create-call",
+      "name": "Create Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        420
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"updated\",\n  \"hubspot_call_id\": \"{{ $json.id }}\",\n  \"contact_id\": \"{{ $('Call exists?').item.json.contact_id }}\",\n  \"contact_was_created\": {{ $('Call exists?').item.json.contact_was_created ? 'true' : 'false' }},\n  \"uniqueid\": \"{{ $('Normalize').item.json.uniqueid }}\",\n  \"phone\": \"{{ $('Normalize').item.json.e164 }}\",\n  \"hs_status\": \"{{ $('Normalize').item.json.hsStatus }}\",\n  \"direction\": \"{{ $('Normalize').item.json.hsDirection }}\"\n}",
+        "options": {}
+      },
+      "id": "respond-updated",
+      "name": "Respond Updated",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2420,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"created\",\n  \"hubspot_call_id\": \"{{ $json.id }}\",\n  \"contact_id\": \"{{ $('Call exists?').item.json.contact_id }}\",\n  \"contact_was_created\": {{ $('Call exists?').item.json.contact_was_created ? 'true' : 'false' }},\n  \"uniqueid\": \"{{ $('Normalize').item.json.uniqueid }}\",\n  \"phone\": \"{{ $('Normalize').item.json.e164 }}\",\n  \"hs_status\": \"{{ $('Normalize').item.json.hsStatus }}\",\n  \"direction\": \"{{ $('Normalize').item.json.hsDirection }}\"\n}",
+        "options": {}
+      },
+      "id": "respond-created",
+      "name": "Respond Created",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2420,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ parseInt($env.POLL_WAIT_MINUTES || '10', 10) }}",
+        "unit": "minutes"
+      },
+      "id": "wait-poll",
+      "name": "Wait POLL_WAIT_MINUTES",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2640,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.GVOIPC_BASE }}?key={{ $env.GVOIPC_API_KEY }}&reqtype=INFO&info=SIMPLECDRS&tenant={{ $env.GVOIPC_TENANT }}&format=json&direction=in&uniqueid={{ encodeURIComponent($('Normalize').item.json.uniqueid) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "get-cdr",
+      "name": "GET CDR (GVoIPC)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2860,
+        540
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Parse the GVoIPC SIMPLECDRS response (array of records) for our uniqueid.\nconst input = $input.first().json;\nconst uid = $('Normalize').item.json.uniqueid;\n\nlet records = [];\nif (Array.isArray(input)) records = input;\nelse if (input && Array.isArray(input.data)) records = input.data;\nelse if (input && typeof input === 'object' && input.sc_uniqueid) records = [input];\n\nconst rec = records.find(r => (r.sc_uniqueid || '').toString() === uid) || records[0] || {};\n\nconst durationSec = parseInt(rec.sc_duration || rec.duration || rec.billsec || 0, 10) || 0;\nconst dispositionRaw = (rec.sc_disposition || rec.disposition || '').toString().toUpperCase().trim();\nconst statusMap = {\n  'ANSWERED': 'COMPLETED',\n  'NO ANSWER': 'NO_ANSWER',\n  'BUSY': 'BUSY',\n  'FAILED': 'FAILED',\n  'CONGESTION': 'FAILED',\n  'CHANUNAVAIL': 'FAILED',\n  'CANCEL': 'CANCELED'\n};\nconst hsStatus = statusMap[dispositionRaw] || (dispositionRaw ? 'COMPLETED' : 'COMPLETED');\nconst startStr = (rec.sc_start || rec.start || '').toString();\nlet startMs;\nif (startStr) {\n  const cleaned = startStr.replace(' ', 'T');\n  const withZ = /[Zz]|[+\\-]\\d{2}:?\\d{2}$/.test(cleaned) ? cleaned : cleaned + 'Z';\n  const d = new Date(withZ);\n  startMs = isNaN(d.getTime()) ? Date.now() : d.getTime();\n} else {\n  startMs = $('Normalize').item.json.startMs;\n}\nconst startISO = new Date(startMs).toISOString();\n\nconst src = (rec.sc_calleridnum || rec.calleridnum || $('Normalize').item.json.src || '').toString();\nconst dst = (rec.sc_dialednum || rec.dialednum || $('Normalize').item.json.dst || '').toString();\nconst whoanswered = (rec.sc_whoanswered || '').toString();\nconst calleridname = (rec.sc_calleridname || '').toString().trim();\n\nconst hubspotCallId = $('Create Call').item.json.id;\n\n// --- contact-name update plan ---\n// Overwrite the contact's firstname/lastname when:\n//   (a) we just auto-created it in this workflow run, OR\n//   (b) the existing contact still has our placeholder pattern (firstname='Unknown'\n//       and lastname starts with 'Caller-') — i.e., a leftover from a prior auto-create.\n// Never overwrite when the existing name is something else (manual entry).\nlet planNeedCreate = false;\ntry { planNeedCreate = $('Plan').item.json.need_create_contact === true; } catch (_e) {}\nlet contactId = '';\ntry { contactId = $('Call exists?').item.json.contact_id || ''; } catch (_e) {}\n\nlet existingPlaceholder = false;\ntry {\n  const props = (($('Search Contact').item.json.results || [])[0] || {}).properties || {};\n  const fn = (props.firstname || '').trim();\n  const ln = (props.lastname || '').trim();\n  existingPlaceholder = fn === 'Unknown' && /^Caller-/.test(ln);\n} catch (_e) {}\n\nconst nameLooksNumeric = /^[\\d\\s+()\\-.]+$/.test(calleridname);\nconst shouldUpdateContact = !!contactId && !!calleridname && !nameLooksNumeric && (planNeedCreate || existingPlaceholder);\nlet cnFirstName = '';\nlet cnLastName = '';\nif (shouldUpdateContact) {\n  const parts = calleridname.split(/\\s+/).filter(Boolean);\n  if (parts.length === 1) {\n    cnFirstName = parts[0].slice(0, 60);\n    cnLastName = '';\n  } else {\n    cnFirstName = parts[0].slice(0, 60);\n    cnLastName = parts.slice(1).join(' ').slice(0, 60);\n  }\n}\n\nconst statusLine = dispositionRaw ? `${dispositionRaw} (${hsStatus})` : 'No CDR record found';\nconst body = [\n  `Disposition: ${statusLine}`,\n  `Duration: ${durationSec}s`,\n  `From: ${src || 'unknown'}` + (calleridname ? ` (${calleridname})` : ''),\n  `To: ${dst || 'unknown'}`,\n  whoanswered ? `Answered by: ${whoanswered}` : null,\n  `External ID: ${uid}`,\n  '',\n  '(transcript pending)'\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    hubspotCallId,\n    uniqueid: uid,\n    durationSec,\n    durationMs: durationSec * 1000,\n    dispositionRaw,\n    hsStatus,\n    startISO,\n    src,\n    dst,\n    calleridname,\n    body,\n    found: !!records.length,\n    contactId,\n    shouldUpdateContact,\n    cnFirstName,\n    cnLastName,\n    raw: rec\n  }\n}];"
+      },
+      "id": "parse-cdr",
+      "name": "Parse CDR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "name-go",
+              "leftValue": "={{ $json.shouldUpdateContact }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-update-name",
+      "name": "Should update contact name?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.1,
+      "position": [
+        3300,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/contacts/{{ $json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"firstname\": {{ JSON.stringify($json.cnFirstName) }},\n    \"lastname\": {{ JSON.stringify($json.cnLastName) }}\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "patch-contact-name",
+      "name": "PATCH Contact (name)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3520,
+        280
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/calls/{{ $('Parse CDR').item.json.hubspotCallId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_call_status\": \"{{ $('Parse CDR').item.json.hsStatus }}\",\n    \"hs_call_duration\": {{ $('Parse CDR').item.json.durationMs }},\n    \"hs_call_body\": {{ JSON.stringify($('Parse CDR').item.json.body) }}\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "patch-cdr",
+      "name": "PATCH HubSpot (CDR)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3300,
+        540
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.GVOIPC_BASE }}?key={{ $env.GVOIPC_API_KEY }}&reqtype=INFO&info=recording&tenant={{ $env.GVOIPC_TENANT }}&id={{ encodeURIComponent($('Normalize').item.json.uniqueid) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "get-recording",
+      "name": "GET Recording (GVoIPC)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3520,
+        540
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "rec-mime",
+              "leftValue": "={{ $binary && $binary.data && $binary.data.mimeType ? $binary.data.mimeType : '' }}",
+              "rightValue": "audio",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-recording",
+      "name": "Has audio recording?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.1,
+      "position": [
+        3740,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/files/v3/files",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "folderPath",
+              "value": "/calls/recordings"
+            },
+            {
+              "name": "options",
+              "value": "{\"access\":\"PUBLIC_INDEXABLE\",\"overwrite\":false,\"duplicateValidationStrategy\":\"NONE\",\"duplicateValidationScope\":\"ENTIRE_PORTAL\"}"
+            },
+            {
+              "name": "fileName",
+              "value": "={{ $('Normalize').item.json.uniqueid }}.mp3"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "upload-recording",
+      "name": "Upload Recording to HubSpot Files",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3960,
+        700
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/calls/{{ $('Parse CDR').item.json.hubspotCallId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_call_recording_url\": \"{{ $json.url }}\"\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "patch-recording-url",
+      "name": "PATCH HubSpot (Recording URL)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4180,
+        700
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.deepgram.com/v1/listen?model=nova-2&punctuate=true&summarize=v2&utterances=true&diarize=true&detect_language=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "={{ $binary.data.mimeType || 'audio/mpeg' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "deepgram",
+      "name": "Deepgram Transcribe+Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3960,
+        480
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "deepgram-api-token",
+          "name": "Deepgram API Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Compose the final HubSpot call body: keep CDR header, append Summary + Transcript.\nconst dg = $input.first().json;\nconst cdr = $('Parse CDR').item.json;\nconst alt = (dg && dg.results && dg.results.channels && dg.results.channels[0] && dg.results.channels[0].alternatives && dg.results.channels[0].alternatives[0]) || {};\nconst transcript = alt.transcript || '';\nconst summary = (dg && dg.results && dg.results.summary && (dg.results.summary.short || dg.results.summary.summary)) || '';\nconst utterances = (dg && dg.results && dg.results.utterances) || [];\nconst durationS = (dg && dg.metadata && dg.metadata.duration) || 0;\n\nlet body = '';\nbody += cdr.body.replace(/\\(transcript pending\\)\\s*$/, '').trim() + '\\n\\n';\nif (summary) body += '## Summary\\n' + summary + '\\n\\n';\nbody += '## Transcript' + (durationS ? ` (${durationS.toFixed(1)}s)` : '') + '\\n';\nif (utterances.length) {\n  for (const u of utterances) {\n    const t = (u.start || 0).toFixed(1);\n    const speaker = (u.speaker !== undefined) ? `Speaker ${u.speaker}: ` : '';\n    body += '[' + t + 's] ' + speaker + u.transcript + '\\n';\n  }\n} else if (transcript) {\n  body += transcript;\n} else {\n  body += '(no transcript - audio may have been silent)';\n}\nif (body.length > 65000) body = body.slice(0, 65000) + '\\n…(truncated)';\n\nreturn [{ json: { hubspotCallId: cdr.hubspotCallId, body, summary, transcript, durationS } }];"
+      },
+      "id": "compose-body",
+      "name": "Compose Body w/ Transcript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4180,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/calls/{{ $json.hubspotCallId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_call_body\": {{ JSON.stringify($json.body) }}\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "patch-transcript",
+      "name": "PATCH HubSpot (Transcript)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4400,
+        480
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Compose error email subject + body. Source for runtime metadata\n// (uniqueid, hubspot call id, prev-node name) tries multiple paths for resilience.\nconst err = $input.first().json;\nlet uniqueid = '';\ntry { uniqueid = $('Normalize').item.json.uniqueid || ''; } catch (_) {}\nlet hubspotCallId = '';\ntry { hubspotCallId = $('Create Call').item.json.id || ''; } catch (_) {}\n\nfunction firstString(...vals) { for (const v of vals) { if (typeof v === 'string' && v) return v; } return ''; }\n\nconst nodeName = firstString(\n  err?.node?.name,\n  err?.error?.node?.name,\n  $execution?.lastNode || '',\n  // n8n v2.x exposes previousNode on input metadata\n  ($input.first()?.source?.[0]?.previousNode) || ''\n) || 'unknown';\n\nconst httpCode = firstString(err?.httpCode, err?.error?.httpCode, err?.context?.statusCode);\nconst description = firstString(\n  err?.description,\n  err?.message,\n  err?.error?.description,\n  err?.error?.message\n) || JSON.stringify(err).slice(0, 800);\n\nconst subject = `[n8n freepbx-hubspot-logger] error in ${nodeName} for uniqueid=${uniqueid || 'na'}`;\nconst text = [\n  `Workflow:    FreePBX → HubSpot Call Logger v3`,\n  `Node:        ${nodeName}`,\n  `HTTP code:   ${httpCode || '-'}`,\n  `Uniqueid:    ${uniqueid || '-'}`,\n  `HubSpot id:  ${hubspotCallId || '-'}`,\n  `Time:        ${new Date().toISOString()}`,\n  ``,\n  `--- error ---`,\n  description,\n].join('\\n');\nreturn [{ json: { subject, text, uniqueid, hubspotCallId, nodeName, httpCode } }];"
+      },
+      "id": "compose-error",
+      "name": "Compose Error Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ ($env.SMTP_FROM_NAME ? $env.SMTP_FROM_NAME + ' <' + $env.SMTP_FROM_EMAIL + '>' : $env.SMTP_FROM_EMAIL) }}",
+        "toEmail": "={{ $env.ERROR_EMAIL_TO }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {}
+      },
+      "id": "send-error-email",
+      "name": "Send Error Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        3520,
+        760
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "smtp-default",
+          "name": "SMTP (default)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook (FreePBX)": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Search Call by external_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Call by external_id": {
+      "main": [
+        [
+          {
+            "node": "Search Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Contact": {
+      "main": [
+        [
+          {
+            "node": "Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan": {
+      "main": [
+        [
+          {
+            "node": "Need create contact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need create contact?": {
+      "main": [
+        [
+          {
+            "node": "Create Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolved (existing)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Contact": {
+      "main": [
+        [
+          {
+            "node": "Resolved (created)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolved (created)": {
+      "main": [
+        [
+          {
+            "node": "Call exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolved (existing)": {
+      "main": [
+        [
+          {
+            "node": "Call exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call exists?": {
+      "main": [
+        [
+          {
+            "node": "PATCH Call",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PATCH Call": {
+      "main": [
+        [
+          {
+            "node": "Respond Updated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Call": {
+      "main": [
+        [
+          {
+            "node": "Respond Created",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Wait POLL_WAIT_MINUTES",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait POLL_WAIT_MINUTES": {
+      "main": [
+        [
+          {
+            "node": "GET CDR (GVoIPC)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET CDR (GVoIPC)": {
+      "main": [
+        [
+          {
+            "node": "Parse CDR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse CDR": {
+      "main": [
+        [
+          {
+            "node": "Should update contact name?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should update contact name?": {
+      "main": [
+        [
+          {
+            "node": "PATCH Contact (name)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PATCH HubSpot (CDR)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PATCH Contact (name)": {
+      "main": [
+        [
+          {
+            "node": "PATCH HubSpot (CDR)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PATCH HubSpot (CDR)": {
+      "main": [
+        [
+          {
+            "node": "GET Recording (GVoIPC)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Recording (GVoIPC)": {
+      "main": [
+        [
+          {
+            "node": "Has audio recording?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has audio recording?": {
+      "main": [
+        [
+          {
+            "node": "Deepgram Transcribe+Summarize",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Recording to HubSpot Files",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Upload Recording to HubSpot Files": {
+      "main": [
+        [
+          {
+            "node": "PATCH HubSpot (Recording URL)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PATCH HubSpot (Recording URL)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deepgram Transcribe+Summarize": {
+      "main": [
+        [
+          {
+            "node": "Compose Body w/ Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Body w/ Transcript": {
+      "main": [
+        [
+          {
+            "node": "PATCH HubSpot (Transcript)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PATCH HubSpot (Transcript)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Compose Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Error Email": {
+      "main": [
+        [
+          {
+            "node": "Send Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

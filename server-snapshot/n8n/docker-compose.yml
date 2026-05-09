@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_DB: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - internal
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: ${N8N_PORT}
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://${N8N_HOST}:${N8N_PORT}/
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      N8N_SECURE_COOKIE: "false"
+      # GVoIPC PBX proxy (Phase-1 v3 polling for CDR + recording)
+      GVOIPC_API_KEY: ${GVOIPC_API_KEY}
+      GVOIPC_TENANT: ${GVOIPC_TENANT}
+      GVOIPC_BASE: ${GVOIPC_BASE}
+      POLL_WAIT_MINUTES: ${POLL_WAIT_MINUTES}
+      ERROR_EMAIL_TO: ${ERROR_EMAIL_TO}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME}
+    ports:
+      - "${N8N_HOST}:${N8N_PORT}:5678"
+      # Also expose on docker0 so freepbx container can reach via host
+      - "172.17.0.1:${N8N_PORT}:5678"
+      - "192.168.10.107:${N8N_PORT}:5678"
+      - "127.0.0.1:${N8N_PORT}:5678"   # for local reverse-tunnels (pinggy, ngrok, cloudflared)
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+  n8n_data:
+
+networks:
+  internal:
+    name: n8n_internal

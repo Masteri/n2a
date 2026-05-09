@@ -1,0 +1,63 @@
+volumes:
+  mysql_data:
+  var_data:
+  etc_data:
+
+networks:
+  defaultnet:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: freepbxint
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+
+secrets:
+  mysql_root_password:
+    file: mysql_root_password.txt
+  freepbxuser_password:
+    file: freepbxuser_password.txt
+  postfix_sasl_passwd:
+    file: sasl_passwd.txt
+
+services:
+  db:
+    restart: always
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      MYSQL_USER: freepbxuser
+      MYSQL_PASSWORD_FILE: /run/secrets/freepbxuser_password
+    secrets:
+      - mysql_root_password
+      - freepbxuser_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./my.cnf:/etc/mysql/my.cnf:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      defaultnet:
+        ipv4_address: 172.30.0.10
+
+  freepbx:
+    restart: always
+    image: escomputers/freepbx:17
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - var_data:/var
+      - etc_data:/etc
+    networks:
+      defaultnet:
+        ipv4_address: 172.30.0.20
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "8088:8088/tcp"
+      - "5060:5060/udp"
+    secrets:
+      - postfix_sasl_passwd
+    depends_on:
+      - db

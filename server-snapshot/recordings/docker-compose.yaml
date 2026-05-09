@@ -1,0 +1,17 @@
+services:
+  recordings:
+    image: nginx:alpine
+    container_name: recordings
+    restart: unless-stopped
+    volumes:
+      - freepbx_var_data:/srv:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./.htpasswd:/etc/nginx/.htpasswd:ro
+    ports:
+      # Tailscale + LAN reachable; HubSpot's cloud cannot reach this without exposing publicly.
+      - "100.99.173.52:8082:80"
+      - "192.168.10.107:8082:80"
+
+volumes:
+  freepbx_var_data:
+    external: true

@@ -1,0 +1,178 @@
+{
+  "id": "freepbx-recording-transcriber",
+  "name": "FreePBX Recording → Deepgram → HubSpot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "freepbx-recording-ready",
+        "responseMode": "responseNode",
+        "options": { "binaryData": true, "rawBody": false }
+      },
+      "id": "wh-1",
+      "name": "Webhook (Recording Ready)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "freepbx-recording-ready"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.deepgram.com/v1/listen?model=nova-2&punctuate=true&summarize=v2&utterances=true&diarize=true&detect_language=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "audio/wav" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "file",
+        "options": { "timeout": 120000 }
+      },
+      "id": "deepgram-1",
+      "name": "Deepgram Transcribe+Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "deepgram-api-token",
+          "name": "Deepgram API Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const dg = $input.first().json;\nconst uniqueid = ($('Webhook (Recording Ready)').item.json.body && $('Webhook (Recording Ready)').item.json.body.uniqueid) || '';\nconst alt = (dg && dg.results && dg.results.channels && dg.results.channels[0] && dg.results.channels[0].alternatives && dg.results.channels[0].alternatives[0]) || {};\nconst transcript = alt.transcript || '';\nconst summary = (dg && dg.results && dg.results.summary && (dg.results.summary.short || dg.results.summary.summary)) || '';\nconst utterances = (dg && dg.results && dg.results.utterances) || [];\nconst durationS = (dg && dg.metadata && dg.metadata.duration) || 0;\n\nlet body = '';\nif (summary) body += '## Summary\\n' + summary + '\\n\\n';\nbody += '## Transcript' + (durationS ? ` (${durationS.toFixed(1)}s)` : '') + '\\n';\nif (utterances.length) {\n  for (const u of utterances) {\n    const t = (u.start || 0).toFixed(1);\n    const speaker = (u.speaker !== undefined) ? `Speaker ${u.speaker}: ` : '';\n    body += '[' + t + 's] ' + speaker + u.transcript + '\\n';\n  }\n} else if (transcript) {\n  body += transcript;\n} else {\n  body += '(no transcript - audio may have been silent)';\n}\nif (body.length > 65000) body = body.slice(0, 65000) + '\\n…(truncated)';\nreturn [{ json: { uniqueid, body, transcript, summary, durationS } }];"
+      },
+      "id": "compose-1",
+      "name": "Compose HubSpot Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/calls/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"filterGroups\": [\n    { \"filters\": [\n      { \"propertyName\": \"hs_call_external_id\", \"operator\": \"EQ\", \"value\": \"{{ $json.uniqueid }}\" }\n    ]}\n  ],\n  \"properties\": [\"hs_call_body\"],\n  \"limit\": 1\n}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "search-1",
+      "name": "HubSpot Search Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.results ? $json.results.length : 0 }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-1",
+      "name": "Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/calls/{{ $json.results[0].id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_call_body\": {{ JSON.stringify($('Compose HubSpot Body').item.json.body) }}\n  }\n}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "patch-1",
+      "name": "HubSpot PATCH Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspot-private-app-token",
+          "name": "HubSpot Private App Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"updated\",\n  \"hubspot_call_id\": \"{{ $('HubSpot Search Call').item.json.results[0].id }}\",\n  \"uniqueid\": \"{{ $('Compose HubSpot Body').item.json.uniqueid }}\",\n  \"body_chars\": {{ $('Compose HubSpot Body').item.json.body.length }},\n  \"summary_present\": {{ $('Compose HubSpot Body').item.json.summary.length > 0 }}\n}",
+        "options": {}
+      },
+      "id": "respond-ok",
+      "name": "Respond Updated",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"no_call_match\",\n  \"uniqueid\": \"{{ $('Compose HubSpot Body').item.json.uniqueid }}\",\n  \"hint\": \"No HubSpot Call has hs_call_external_id matching this uniqueid. Make sure the Phase-1 workflow ran and completed before the recording finished.\"\n}",
+        "options": {}
+      },
+      "id": "respond-nomatch",
+      "name": "Respond No Match",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1340, 400]
+    }
+  ],
+  "connections": {
+    "Webhook (Recording Ready)": {
+      "main": [[{ "node": "Deepgram Transcribe+Summarize", "type": "main", "index": 0 }]]
+    },
+    "Deepgram Transcribe+Summarize": {
+      "main": [[{ "node": "Compose HubSpot Body", "type": "main", "index": 0 }]]
+    },
+    "Compose HubSpot Body": {
+      "main": [[{ "node": "HubSpot Search Call", "type": "main", "index": 0 }]]
+    },
+    "HubSpot Search Call": {
+      "main": [[{ "node": "Found?", "type": "main", "index": 0 }]]
+    },
+    "Found?": {
+      "main": [
+        [{ "node": "HubSpot PATCH Call", "type": "main", "index": 0 }],
+        [{ "node": "Respond No Match", "type": "main", "index": 0 }]
+      ]
+    },
+    "HubSpot PATCH Call": {
+      "main": [[{ "node": "Respond Updated", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "pinData": {}
+}
