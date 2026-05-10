@@ -97,3 +97,10 @@ A flat lookup of every gotcha hit during the build, plus the diagnostic that poi
 
 - `../n8n-freepbx-runbook.md` — original chronological narrative with every dead end
 - `../n8n-freepbx-conversation.md` — full session transcript
+
+## HubSpot UI rendering
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Markdown in `hs_call_body` (`## Heading`, line breaks) renders as one mushed paragraph in the HubSpot Call detail | HubSpot's UI HTML-encodes the body and ignores Markdown. Plain `\n` collapses to a single space when rendered. | Emit HTML: `<h3>...</h3><p>...<br>...</p>`. The `Compose Body w/ Transcript` node now does this — see workflow JSON. |
+| HubSpot's "Call notes / AI summary" widget shows "No transcript available" even though `hs_call_body` has the transcript | That widget is HubSpot's own AI feature — separate from `hs_call_body`. It only fires when HubSpot can fetch an audio file via `hs_call_recording_url`, OR when the call was made through HubSpot's Calling Extensions SDK. Our recording URL points at a Tailscale-only nginx, which HubSpot's cloud cannot reach. | Two paths: (a) upload the recording to HubSpot Files (`POST /files/v3/files`), get the `hubspotusercontent` URL, then PATCH `hs_call_recording_url` — the v3 workflow has the `Upload Recording to HubSpot Files` node already, just needs to actually run; (b) put the recordings nginx behind a public TLS endpoint (Tailscale Funnel, Cloudflare Tunnel, or a real cert). |

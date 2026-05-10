@@ -7,7 +7,7 @@
 | xAI API key | `xai-…` | `/home/masterok/n8n/KEYS.txt` (not currently wired in) | reserved |
 | HubSpot Service Key | `pat-naX-…` | `/home/masterok/n8n/private_key.txt` (laptop, chmod 600) → n8n credential `hubspot-private-app-token` | Phase 1 + Phase 2 HubSpot calls |
 | Asterisk ARI password | 32-hex | `/srv/docker/freepbx/asterisk/.ari-credentials.txt` (root, chmod 600) → `/srv/docker/ava/.env` (`ASTERISK_ARI_PASSWORD`) → in-container `/etc/asterisk/ari_custom.conf` | AVA → Asterisk authentication |
-| FreePBX ext 1001 secret | `<EXT_1001_SECRET>` (test value) | MariaDB `sip` table + baresip's `/root/.baresip/accounts` | SIP UA registration |
+| FreePBX ext 1001 secret | `t3st-1001-secret` (test value) | MariaDB `sip` table + baresip's `/root/.baresip/accounts` | SIP UA registration |
 | MariaDB root password | 32-hex | `/srv/docker/freepbx/mysql_root_password.txt` (Docker secret) + `.credentials.txt` mirror | FreePBX schema |
 | MariaDB freepbxuser password | 32-hex | `/srv/docker/freepbx/freepbxuser_password.txt` (Docker secret) + `.credentials.txt` mirror | FreePBX runtime |
 | n8n Postgres password | 32-hex | `/srv/docker/n8n/.env` (`POSTGRES_PASSWORD`) | n8n service |

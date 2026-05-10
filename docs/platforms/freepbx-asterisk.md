@@ -66,7 +66,7 @@ Active contexts:
 ### Extension `1001`
 
 PJSIP extension. Provisioned via `fwconsole bulkimport`.
-Secret: `<EXT_1001_SECRET>`. Direct media: **`no`** (forced via `sip` table for MixMonitor capture).
+Secret: `t3st-1001-secret`. Direct media: **`no`** (forced via `sip` table for MixMonitor capture).
 
 ## Modifications applied to FreePBX-managed files
 

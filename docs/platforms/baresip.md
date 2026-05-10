@@ -20,7 +20,7 @@ AVA's StasisStart handler validates that the caller channel isn't a bare `Local/
 ## Account
 
 ```
-<sip:1001@127.0.0.1>;auth_user=1001;auth_pass=<EXT_1001_SECRET>;answermode=auto;regint=60
+<sip:1001@127.0.0.1>;auth_user=1001;auth_pass=t3st-1001-secret;answermode=auto;regint=60
 ```
 
 Registers UDP to FreePBX at `127.0.0.1:5060`.
