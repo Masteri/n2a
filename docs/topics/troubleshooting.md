@@ -98,6 +98,31 @@ A flat lookup of every gotcha hit during the build, plus the diagnostic that poi
 - `../n8n-freepbx-runbook.md` — original chronological narrative with every dead end
 - `../n8n-freepbx-conversation.md` — full session transcript
 
+## HubSpot Call read-only fields (Conversation Intelligence)
+
+| Field | Status via API | Populated by |
+| --- | --- | --- |
+| `hs_call_body` | ✅ writable | us (HTML body with summary + transcript) |
+| `hs_call_recording_url` | ✅ writable | us (HubSpot Files URL after upload) |
+| `hs_call_summary` | 🔒 **read-only** — `READ_ONLY_VALUE` on PATCH | HubSpot's AI / Conversation Intelligence pipeline only |
+| `hs_call_has_transcript` | 🔒 **read-only** | HubSpot AI |
+| `hs_call_recording_duration` | 🔒 **read-only** | HubSpot AI (derived from the recording on their side) |
+| `hs_call_transcription_id` | 🔒 **read-only** | HubSpot AI |
+
+**Implication:** the "Call notes / AI summary" widget in HubSpot's Call detail UI is driven by these read-only fields, not by `hs_call_body`. They get populated only when the call is processed through:
+
+1. **HubSpot's native Calling**, OR
+2. **A registered Calling Extensions app** (Aircall, RingCentral, etc.), OR
+3. **Conversation Intelligence** auto-processing of `hs_call_recording_url` — gated behind subscription tier and may take minutes after the URL is set.
+
+For our integration (n8n + Service Key + arbitrary recording URL), the data lands in `hs_call_body` and the audio player works (since we set `hs_call_recording_url` to a HubSpot Files URL), but the AI summary widget will stay empty unless the account's Conversation Intelligence picks it up. There is no workaround via REST PATCH.
+
+## HubSpot Files API for recordings
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Need a public URL for `hs_call_recording_url` but our nginx is Tailscale-only | HubSpot's UI fetches the recording from the URL we provide; non-public URLs return 4xx in their player | Upload the recording to HubSpot Files: `POST /files/v3/files` with `folderPath`, `fileName`, `options={"access":"PUBLIC_INDEXABLE",...}`, multipart `file` field. Returns a `https://<portalId>.fs1.hubspotusercontent-na2.net/...` URL that's publicly fetchable. The v3 workflow's `Upload Recording to HubSpot Files` node already does this. |
+
 ## HubSpot UI rendering
 
 | Symptom | Cause | Fix |
