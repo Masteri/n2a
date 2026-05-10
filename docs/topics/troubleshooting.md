@@ -77,6 +77,22 @@ A flat lookup of every gotcha hit during the build, plus the diagnostic that poi
 | --- | --- | --- |
 | `ssh-copy-id` fails with `ssh_askpass: exec(/usr/bin/ssh-askpass): No such file or directory` | Running through Claude's `!` shell which has no TTY | Run from a real terminal app, OR install `ssh-askpass-gnome`, OR use `sshpass` |
 
+## Deepgram
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Deepgram returns **HTTP 400 with empty body** for every request, no error message | The API key has a stray non-printable byte (e.g. `\026` SYN, `\r`, BOM) at the start, copy-pasted from a terminal/clipboard | Strip control chars: `tr -d '[:cntrl:]' < KEYS.txt > KEYS.cleaned.txt`. Verify with `od -An -c <(grep ^DEEPGRAM_API_KEY KEYS.txt \| cut -d= -f2)` — first byte should be a hex digit. Re-import the n8n credential with the cleaned value. |
+| Same key worked yesterday, doesn't today | Free tier credits exhausted, or rate-limit | Check Deepgram console; key body would contain a JSON error in this case. Empty body usually means invalid key (vs throttled). |
+
+## n8n v3 workflow + GVoIPC (MiRTA PBX) integration
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| HubSpot Call body permanently shows `(transcript pending)` after the 10-min `POLL_WAIT_MINUTES` window | The `GET Recording (GVoIPC)` node passes the uniqueid as posted by `pbx4fl` (`pbx4fl-<sec>_<seq>`), but MiRTA PBX (the platform GVoIPC runs on) stores recordings with the Asterisk-native dot separator (`pbx4fl-<sec>.<seq>`). The `id=` lookup misses → empty body → no recording → no Deepgram → no transcript. Verified by hitting the `info=recording` endpoint with both forms: underscore returns 0 bytes / `text/html`; dot returns the actual MP3 (`audio/mpeg`, ~64 KB). | In the workflow's `GET Recording (GVoIPC)` node, change the `id` expression from `{{ encodeURIComponent($('Normalize').item.json.uniqueid) }}` to `{{ encodeURIComponent($('Normalize').item.json.uniqueid.replace(/_/g,'.')) }}`. Keep the underscore form for `hs_call_external_id` (HubSpot is fine with either). |
+| `GET CDR (GVoIPC)` returns empty body for every call | The workflow uses `info=SIMPLECDRS` with `direction=in&uniqueid=…`, but per the [MiRTA proxyapi docs](https://www.mirtapbx.com/manual/index.php/Proxyapi) `SIMPLECDRS` only accepts `tenant`, `calleridnum`, `start`, `end` — uniqueid filtering is not a parameter for that endpoint. | Either switch the node to `reqtype=CDR` (separate top-level reqtype that does take uniqueid), or use SIMPLECDRS with the documented params (`calleridnum=<src>&start=<call_date>&end=<call_date>`). Out of scope for the current transcription fix — but worth fixing if you want CDR enrichment to populate the body. |
+| GVoIPC's API returns `Too bad... you mistaken the security api key.` for `info=VERSION` or `info=TENANTS` | These are admin/full-access endpoints that a read-only key (`API_READ_ONLY` per the customer's naming) is **not authorized** to hit. **This is NOT a sign that the key is invalid for SIMPLECDRS or recording lookups.** The same key works fine for `info=recording`. | Don't probe admin endpoints with a read-only key — and don't infer key validity from their response. Test the specific endpoint your workflow uses. |
+| GVoIPC's API silently returns `HTTP 200, Content-Length: 0` for many error paths | MiRTA's `proxyapi.php` returns empty bodies (rather than error messages) for: invalid `info=` value, missing query params for that endpoint, lookup miss on a valid endpoint, missing-permission for some endpoints. | Don't infer "auth failure" from empty body. Cross-check by hitting an endpoint your key IS authorized for; if THAT also returns empty, look at the query params. Look at the docs first to verify param names. |
+
 ## See also
 
 - `../n8n-freepbx-runbook.md` — original chronological narrative with every dead end
